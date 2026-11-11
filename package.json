@@ -1,0 +1,18 @@
+{
+  "name": "smaug-finance-bot",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check src/index.js && node --check src/core.js && node --check src/infographic.js",
+    "dev": "npx wrangler dev",
+    "deploy": "npx wrangler deploy",
+    "db:local": "npx wrangler d1 migrations apply smaug-finance --local",
+    "db:remote": "npx wrangler d1 migrations apply smaug-finance --remote",
+    "webhook": "node scripts/register-webhook.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4.45.0"
+  }
+}
