@@ -439,9 +439,10 @@ async function scheduled(controller, env) {
     text = `${nameOf(env)}, доброе утро. ${budget ? 'На этот период осталось ' + money(budget.remaining_minor,currencyOf(env)) + '.' : 'Лимит на сегодня ещё не задан.'}${reminders.length ? '\n\nПлатежи на подходе:\n' + reminders.join('\n') : ''}`;
     key = `morning:${day}`;
   } else if (hour === evening && minute === eveningMinute) {
-    const count = await one(env.FINANCE_DB, 'SELECT COUNT(*) n FROM ledger_entries WHERE happened_on=?', day);
+    const count = await one(env.FINANCE_DB, "SELECT COUNT(*) n FROM ledger_entries WHERE happened_on=? AND kind='expense'", day);
+    if (count.n) return;
     const variants = ['Дракон пересчитывает монеты. Все сегодняшние траты записаны?', 'Вечерняя сверка казны: не забылись ли мелкие покупки?', 'Казна готовится ко сну. Что сегодня изменилось?'];
-    text = `${nameOf(env)}, ${variants[Number(day.replaceAll('-','')) % variants.length]}${!count.n ? '\nЗа день нет записей. День был бесплатным или что-то забылось?' : ''}`;
+    text = `${nameOf(env)}, ${variants[Number(day.replaceAll('-','')) % variants.length]}\nЗа день нет записанных расходов. День был бесплатным или что-то забылось?`;
     key = `evening:${day}`;
   }
   if (!key || await one(env.FINANCE_DB, 'SELECT key FROM notification_log WHERE key=?', key)) return;
