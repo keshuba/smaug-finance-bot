@@ -85,3 +85,43 @@ test('webhook отвергает запрос без секретного заг
   }), { FINANCE_DB: {}, TELEGRAM_BOT_TOKEN: 'token', TELEGRAM_WEBHOOK_SECRET: 'secret' });
   assert.equal(result.status, 403);
 });
+
+test('вечерний вопрос приходит лишь в день без записанных расходов', async () => {
+  const queries = [];
+  const fakeDb = expenseCount => ({
+    prepare(sql) {
+      queries.push(sql);
+      return {
+        bind() {
+          return {
+            async first() {
+              if (sql.includes('FROM ledger_entries')) return { n: expenseCount };
+              if (sql.includes('FROM notification_log')) return null;
+              throw new Error('unexpected query');
+            },
+            async run() { return { success: true }; },
+          };
+        },
+      };
+    },
+  });
+  const controller = { scheduledTime: Date.parse('2026-04-02T19:30:00Z') };
+  const config = { TELEGRAM_BOT_TOKEN: 'test-token', TELEGRAM_OWNER_ID: '123',
+    OWNER_NAME: 'Тест', TIME_ZONE: 'Europe/Moscow', EVENING_HOUR: '22', EVENING_MINUTE: '30' };
+  const originalFetch = globalThis.fetch;
+  const sent = [];
+  globalThis.fetch = async (_url, options) => {
+    sent.push(JSON.parse(options.body));
+    return new Response('{}', { status: 200 });
+  };
+  try {
+    await worker.scheduled(controller, { ...config, FINANCE_DB: fakeDb(1) });
+    assert.equal(sent.length, 0);
+    await worker.scheduled(controller, { ...config, FINANCE_DB: fakeDb(0) });
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /День был бесплатным/);
+    assert.ok(queries.some(sql => sql.includes("kind='expense'")));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
