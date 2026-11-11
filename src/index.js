@@ -1,7 +1,8 @@
 import {
   DEFAULT_TIME_ZONE, assessPurchase, detectAccount, detectCategory, displayDate,
   isCompletedExpense, isPurchaseIntent, isWeeklyBudgetQuestion, localDate, localHour, money,
-  parseOperation, parsePurchase, shiftDate,
+  nextMonthlyDue, parseAmount, parseDay, parseOperation, parsePurchase, parseRecurringPayment,
+  recurringOccurrences, shiftDate,
 } from './core.js';
 import { infographicHtml } from './infographic.js';
 
@@ -58,7 +59,16 @@ async function accounts(db) {
     COALESCE(SUM(CASE WHEN l.kind='income' THEN l.amount_minor ELSE -l.amount_minor END),0) delta_minor
     FROM accounts a LEFT JOIN ledger_entries l ON l.account_id=a.id AND l.id>a.balance_ledger_id
     GROUP BY a.id ORDER BY a.sort_order,a.id`);
-  return list.map(a => ({ ...a, current_minor: a.balance_minor + a.delta_minor }));
+  const result = list.map(a => ({ ...a, current_minor: a.balance_minor + a.delta_minor }));
+  const transfers = await rows(db, `SELECT id,from_account_id,to_account_id,amount_minor
+    FROM account_transfers ORDER BY id`);
+  for (const transfer of transfers) {
+    const from = result.find(a => a.id === transfer.from_account_id);
+    const to = result.find(a => a.id === transfer.to_account_id);
+    if (from && transfer.id > from.balance_transfer_id) from.current_minor -= transfer.amount_minor;
+    if (to && transfer.id > to.balance_transfer_id) to.current_minor += transfer.amount_minor;
+  }
+  return result;
 }
 async function categories(db) { return rows(db, 'SELECT * FROM categories ORDER BY title'); }
 async function dialog(db, chatId) {
@@ -140,9 +150,68 @@ export async function weeklyBudgetReply(db, env, now = new Date(), question = ''
     (weekLeft === 0 ? '\n\nЕсли покупка нужна сейчас, напиши что и за сколько — пересчитаем план.' : '');
 }
 async function obligations(db, start, end, currency) {
-  const row = await one(db, `SELECT COALESCE(SUM(amount_minor),0) total FROM scheduled_payments
+  const oneOff = await rows(db, `SELECT title,due_on,amount_minor FROM scheduled_payments
     WHERE status='planned' AND currency=? AND due_on BETWEEN ? AND ?`, currency, start, end);
-  return row.total;
+  const recurring = await recurringBetween(db, start, end);
+  return oneOff.reduce((sum, p) => sum + p.amount_minor, 0) +
+    recurring.filter(p => p.currency === currency && !oneOff.some(d =>
+      d.due_on === p.due_on && d.title.toLowerCase() === p.title.toLowerCase()))
+      .reduce((sum, p) => sum + p.amount_minor, 0);
+}
+async function recurringBetween(db, start, end) {
+  const rules = await rows(db, `SELECT id,title,day_of_month,amount_minor,currency
+    FROM recurring_payments WHERE status='active' ORDER BY day_of_month,title`);
+  return recurringOccurrences(rules, start, end);
+}
+async function createRecurring(db, chatId, input, sourceKey, currency, today) {
+  const parsed = parseRecurringPayment(input);
+  if (parsed.error) return parsed.error;
+  const existing = await one(db, `SELECT id FROM recurring_payments
+    WHERE lower(title)=lower(?) AND day_of_month=? AND status='active'`,
+    parsed.title, parsed.day_of_month);
+  if (existing) return `Такой ежемесячный платёж уже есть под номером ${existing.id}. Посмотри /reminders.`;
+  const result = await db.prepare(`INSERT OR IGNORE INTO recurring_payments
+    (title,day_of_month,amount_minor,currency,status,source_key)
+    VALUES (?,?,?,?,'active',?)`)
+    .bind(parsed.title, parsed.day_of_month, parsed.amount_minor, currency, sourceKey).run();
+  await clearDialog(db, chatId);
+  if (!result.meta?.changes) return 'Этот платёж уже записан. Посмотри /reminders.';
+  const due = nextMonthlyDue(today, parsed.day_of_month);
+  return `Записал ежемесячный платёж «${parsed.title}»: ${money(parsed.amount_minor,currency)}. Ближайшая дата — ${displayDate(due)}. Напомню за 3 дня, накануне и в день платежа утром. Если он списывается автоматически, напоминание всё равно придёт.`;
+}
+function withdrawalDraft(text, sourceKey, now, timeZone) {
+  const date = parseDay(text, now, timeZone);
+  if (date.error) return date;
+  const amount_minor = parseAmount(date.withoutDate);
+  if (!amount_minor) return { error: 'Назови одну сумму снятия, например «сняла 5000 на психолога».' };
+  return { day: date.day, amount_minor, note: text.slice(0, 500), source_key: sourceKey };
+}
+async function commitWithdrawal(db, chatId, draft, source, cash, currency) {
+  const result = await db.prepare(`INSERT OR IGNORE INTO account_transfers
+    (source_key,happened_on,amount_minor,currency,from_account_id,to_account_id,note)
+    VALUES (?,?,?,?,?,?,?)`)
+    .bind(draft.source_key, draft.day, draft.amount_minor, currency,
+      source.id, cash.id, draft.note).run();
+  await clearDialog(db, chatId);
+  if (!result.meta?.changes) return 'Это снятие уже записано. Повторно не добавлял.';
+  return `Записал снятие ${money(draft.amount_minor,currency)}: ${source.title} −${money(draft.amount_minor,currency)}, наличные +${money(draft.amount_minor,currency)}. Это перевод между своими счетами, не расход.${/психолог/i.test(draft.note) ? ' Оплату сессии отмечу отдельно после твоего подтверждения.' : ''}`;
+}
+async function handleWithdrawal(db, env, chatId, draft, sourceText = draft.note, requireNamed = false) {
+  const currency = currencyOf(env);
+  const list = await accounts(db);
+  const debit = list.filter(a => a.kind === 'debit' && a.currency === currency);
+  const cash = list.filter(a => a.kind === 'cash' && a.currency === currency);
+  if (cash.length !== 1) return 'Добавь один счёт наличных в основной валюте, чтобы я мог записать снятие.';
+  const named = debit.filter(a => detectAccount(sourceText, [a]));
+  if (named.length > 1) return 'Вижу две карты. Назови одну, с которой сняла наличные.';
+  const settingRow = await one(db, "SELECT value FROM settings WHERE key='default_cash_withdrawal_account_id'");
+  const configured = debit.find(a => a.id === Number(settingRow?.value));
+  const source = named[0] || (requireNamed ? null : configured || (debit.length === 1 ? debit[0] : null));
+  if (!source) {
+    await setDialog(db, chatId, { type: 'withdrawal_source', draft });
+    return `Понял снятие ${money(draft.amount_minor,currency)}. С какой карты? Это перевод в наличные, не оплата покупки.`;
+  }
+  return commitWithdrawal(db, chatId, draft, source, cash[0], currency);
 }
 async function overview(db, env, kind, now = new Date()) {
   const day = localDate(now, zoneOf(env));
@@ -176,7 +245,12 @@ async function overview(db, env, kind, now = new Date()) {
   }
   if (kind === 'plan') {
     const budget = await budgetBreakdown(db, day, currency);
-    const payments = await rows(db, "SELECT * FROM scheduled_payments WHERE status='planned' AND due_on>=? ORDER BY due_on LIMIT 8", day);
+    const end = budget?.budget.ends_on || shiftDate(day, 30);
+    const oneOff = await rows(db, `SELECT * FROM scheduled_payments
+      WHERE status='planned' AND due_on BETWEEN ? AND ? ORDER BY due_on LIMIT 8`, day, end);
+    const recurring = (await recurringBetween(db, day, end)).filter(p => !oneOff.some(d =>
+      d.due_on === p.due_on && d.title.toLowerCase() === p.title.toLowerCase()));
+    const payments = [...oneOff, ...recurring].sort((a, b) => a.due_on.localeCompare(b.due_on)).slice(0, 8);
     const lines = payments.map(p => `• ${displayDate(p.due_on)} · ${p.title}: ${money(p.amount_minor,p.currency)}`);
     const budgetLine = budget ? `На эту неделю до ${displayDate(budget.weekEnd)} осталось ${money(Math.max(0,budget.weekLimit-budget.weekSpent),currency)} из ${money(budget.weekLimit,currency)}. На весь период ${displayDate(budget.budget.starts_on)}–${displayDate(budget.budget.ends_on)} осталось ${money(Math.max(0,budget.budget.remaining_minor),currency)} из ${money(budget.budget.limit_minor,currency)}.`
       : 'Утверждённый лимит на сегодня не задан.';
@@ -361,9 +435,36 @@ async function handleMessage(update, env, ctx) {
     return response(chatId, 'Отменено. Новых записей нет.');
   }
   if (['start','help'].includes(command)) return response(chatId,
-    `Я Смауг, хранитель казны. /treasury, /plan, /debts, /history — карточки; добавь _list для списка. /buy — оценить покупку, /expense и /income — записать операцию. Можно писать «купила шампунь 500 ₽» или «хочу купить книгу за 800 ₽». Неясный счёт или категорию уточню. /cancel отменяет диалог.`);
+    `Я Смауг, хранитель казны. /treasury, /plan, /debts, /history — карточки; добавь _list для списка. /buy — оценить покупку, /expense и /income — записать операцию. /remind — добавить ежемесячный платёж, /reminders — посмотреть напоминания. Неясный счёт или категорию уточню. /cancel отменяет диалог.`);
   if (command === 'settings') return response(chatId,
-    `Имя: ${nameOf(env)}. Часовой пояс: ${zoneOf(env)}. Валюта: ${currencyOf(env)}. Счета, лимиты и напоминания настраиваются в D1; смотри README.`);
+    `Имя: ${nameOf(env)}. Часовой пояс: ${zoneOf(env)}. Валюта: ${currencyOf(env)}. Ежемесячные платежи добавляются через /remind. Счета, лимиты и разовые платежи пока настраиваются в D1.`);
+  if (command === 'reminders') {
+    const recurring = await rows(db, `SELECT id,title,day_of_month,amount_minor,currency
+      FROM recurring_payments WHERE status='active' ORDER BY day_of_month,title`);
+    const oneOff = await rows(db, `SELECT title,due_on,amount_minor,currency
+      FROM scheduled_payments WHERE status='planned' AND due_on>=? ORDER BY due_on LIMIT 8`, localDate(now, zoneOf(env)));
+    const today = localDate(now, zoneOf(env));
+    const monthly = recurring.map(p => `• №${p.id} · ${p.title}: ${money(p.amount_minor,p.currency)} · ближайшая дата ${displayDate(nextMonthlyDue(today,p.day_of_month))}`);
+    const dated = oneOff.map(p => `• ${displayDate(p.due_on)} · ${p.title}: ${money(p.amount_minor,p.currency)}`);
+    return response(chatId, `${nameOf(env)}, напоминания о платежах:\n\nКаждый месяц:\n${monthly.join('\n') || 'Пока нет.'}\n\nРазовые платежи:\n${dated.join('\n') || 'Пока нет.'}\n\nДобавить: /remind. Отключить: /remind_off номер.`);
+  }
+  if (command === 'remind_off') {
+    const id = Number(text.replace(/^\/remind_off(?:@[a-z_]+)?/i, '').trim());
+    if (!Number.isSafeInteger(id) || id < 1) return response(chatId, 'Напиши номер из /reminders, например /remind_off 1.');
+    const rule = await one(db, "SELECT title FROM recurring_payments WHERE id=? AND status='active'", id);
+    if (!rule) return response(chatId, 'Активного напоминания с таким номером нет. Посмотри /reminders.');
+    await db.prepare("UPDATE recurring_payments SET status='disabled' WHERE id=? AND status='active'").bind(id).run();
+    return response(chatId, `Отключил напоминание «${rule.title}». Финансовые записи не менял.`);
+  }
+  if (command === 'remind') {
+    const input = text.replace(/^\/remind(?:@[a-z_]+)?/i, '').trim();
+    if (!input) {
+      await setDialog(db, chatId, { type: 'recurring_prompt' });
+      return response(chatId, 'Напиши день месяца, сумму без пробелов и название: 20 800 Вайфай. Напомню за 3 дня, накануне и в день платежа утром.');
+    }
+    return response(chatId, await createRecurring(db, chatId, input,
+      `message:${update.update_id}`, currencyOf(env), localDate(now, zoneOf(env))));
+  }
   if (isWeeklyBudgetQuestion(text)) return response(chatId, await weeklyBudgetReply(db, env, now, text));
   const kinds = { treasury: 'treasury', treasury_list: 'treasury', plan: 'plan',
     plan_list: 'plan', plan_overview: 'plan', debts: 'debts', debts_list: 'debts',
@@ -386,6 +487,20 @@ async function handleMessage(update, env, ctx) {
       : response(chatId, result.text, { reply_markup: result.markup });
   }
   const state = await dialog(db, chatId);
+  if (state?.type === 'recurring_prompt') return response(chatId,
+    await createRecurring(db, chatId, text, `message:${update.update_id}`,
+      currencyOf(env), localDate(now, zoneOf(env))));
+  if (state?.type === 'withdrawal_source') return response(chatId,
+    await handleWithdrawal(db, env, chatId, state.draft, text, true));
+  if (/^(?:сняла|снял)(?:\s|$)/i.test(text)) {
+    const draft = withdrawalDraft(text, `message:${update.update_id}`, now, zoneOf(env));
+    return response(chatId, draft.error ? draft.error :
+      await handleWithdrawal(db, env, chatId, draft));
+  }
+  if (/^(?:напомни|напоминай)(?:\s|$)/i.test(text)) {
+    await setDialog(db, chatId, { type: 'recurring_prompt' });
+    return response(chatId, 'Добавим ежемесячный платёж. Напиши: 20 800 Вайфай — день месяца, сумма, название.');
+  }
   if (state?.type === 'buy_prompt') {
     const result = await offer(db, env, chatId, text, update.update_id, now);
     return typeof result === 'string' ? response(chatId, result)
@@ -432,7 +547,10 @@ async function scheduled(controller, env) {
   if (hour === morning && minute === 0) {
     const due = await rows(env.FINANCE_DB, `SELECT * FROM scheduled_payments
       WHERE status='planned' AND due_on BETWEEN ? AND ? ORDER BY due_on`, day, shiftDate(day, 3));
-    const reminders = due.filter(p => [0,1,3].includes(Math.round(
+    const recurring = await recurringBetween(env.FINANCE_DB, day, shiftDate(day, 3));
+    const uniqueRecurring = recurring.filter(p => !due.some(d => d.due_on === p.due_on &&
+      d.title.toLowerCase() === p.title.toLowerCase()));
+    const reminders = [...due, ...uniqueRecurring].filter(p => [0,1,3].includes(Math.round(
       (Date.parse(p.due_on + 'T12:00:00Z') - Date.parse(day + 'T12:00:00Z')) / 86400000,
     ))).map(p => `• ${p.title}: ${money(p.amount_minor,p.currency)} · ${displayDate(p.due_on)}`);
     const budget = await currentBudget(env.FINANCE_DB, day, currencyOf(env));

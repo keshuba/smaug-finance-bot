@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  assessPurchase, isWeeklyBudgetQuestion, parseOperation, parsePurchase,
+  assessPurchase, isWeeklyBudgetQuestion, monthlyDueDate, nextMonthlyDue,
+  parseOperation, parsePurchase, parseRecurringPayment, recurringOccurrences,
 } from '../src/core.js';
 import worker, { weeklyBudgetReply } from '../src/index.js';
 
@@ -124,4 +125,19 @@ test('вечерний вопрос приходит лишь в день без
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test('регулярный платёж разбирается без путаницы дня и суммы', () => {
+  assert.deepEqual(parseRecurringPayment('20 800 Вайфай'),
+    { day_of_month: 20, amount_minor: 80000, title: 'Вайфай' });
+  assert.deepEqual(parseRecurringPayment('/remind 5 1299,50 Подписка'),
+    { day_of_month: 5, amount_minor: 129950, title: 'Подписка' });
+  assert.match(parseRecurringPayment('20 1 200 Вайфай').error, /Назови платёж/);
+});
+
+test('31-е число короткого месяца переносится на его последний день', () => {
+  assert.equal(monthlyDueDate('2027-02', 31), '2027-02-28');
+  assert.equal(nextMonthlyDue('2027-02-28', 31), '2027-02-28');
+  assert.deepEqual(recurringOccurrences([{ title: 'Тест', day_of_month: 31 }],
+    '2027-02-27', '2027-03-01').map(x => x.due_on), ['2027-02-28']);
 });

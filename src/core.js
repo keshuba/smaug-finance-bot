@@ -146,6 +146,51 @@ export function assessPurchase({ amount_minor, available_minor, obligations_mino
   return { level: 'ok', after, reason: 'Покупка помещается в текущий план.' };
 }
 
+export function parseRecurringPayment(text) {
+  const match = /^(?:\/remind(?:@[a-z0-9_]+)?\s+)?(\d{1,2})\s+(\d+(?:[.,]\d{1,2})?)\s*(?:₽|руб(?:лей|ля|ль)?\.?)?\s+(.+)$/i.exec(String(text).trim());
+  if (!match) return { error: 'Напиши день месяца, сумму без пробелов и название: 20 800 Вайфай.' };
+  const day_of_month = Number(match[1]);
+  const amount_minor = Math.round(Number(match[2].replace(',', '.')) * 100);
+  const title = match[3].trim();
+  if (day_of_month < 1 || day_of_month > 31)
+    return { error: 'День месяца должен быть от 1 до 31.' };
+  if (!Number.isSafeInteger(amount_minor) || amount_minor < 1 || amount_minor > 1_000_000_000)
+    return { error: 'Проверь сумму платежа в рублях.' };
+  if (title.length < 2 || title.length > 80 || /^\d/.test(title) || /[\r\n]/.test(title))
+    return { error: 'Назови платёж после суммы, например: 20 800 Вайфай.' };
+  return { day_of_month, amount_minor, title };
+}
+
+export function monthlyDueDate(yearMonth, dayOfMonth) {
+  if (!/^\d{4}-\d{2}$/.test(yearMonth) || !Number.isInteger(dayOfMonth) ||
+      dayOfMonth < 1 || dayOfMonth > 31) throw new RangeError('invalid_monthly_due');
+  const [year, month] = yearMonth.split('-').map(Number);
+  if (month < 1 || month > 12) throw new RangeError('invalid_monthly_due');
+  const last = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  return `${yearMonth}-${String(Math.min(dayOfMonth, last)).padStart(2, '0')}`;
+}
+
+export function nextMonthlyDue(day, dayOfMonth) {
+  let due = monthlyDueDate(day.slice(0, 7), dayOfMonth);
+  if (due < day) {
+    const [year, month] = day.slice(0, 7).split('-').map(Number);
+    const next = new Date(Date.UTC(year, month, 1));
+    due = monthlyDueDate(next.toISOString().slice(0, 7), dayOfMonth);
+  }
+  return due;
+}
+
+export function recurringOccurrences(rules, start, end) {
+  const result = [];
+  for (let day = start; day <= end; day = shiftDate(day, 1)) {
+    for (const rule of rules) {
+      if (monthlyDueDate(day.slice(0, 7), rule.day_of_month) === day)
+        result.push({ ...rule, due_on: day });
+    }
+  }
+  return result;
+}
+
 export function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, char => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
