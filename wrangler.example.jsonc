@@ -1,0 +1,27 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "smaug-finance",
+  "main": "src/index.js",
+  "compatibility_date": "2026-11-11",
+  "workers_dev": true,
+  "vars": {
+    "TIME_ZONE": "Europe/Moscow",
+    "BASE_CURRENCY": "RUB",
+    "OWNER_NAME": "",
+    "PERIOD_LABEL": "конца периода",
+    "MORNING_HOUR": "9",
+    "EVENING_HOUR": "21",
+    "EVENING_MINUTE": "0"
+  },
+  "d1_databases": [
+    {
+      "binding": "FINANCE_DB",
+      "database_name": "smaug-finance",
+      "database_id": "REPLACE_WITH_YOUR_OWN_D1_DATABASE_ID",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "browser": { "binding": "BROWSER" },
+  "triggers": { "crons": ["0,30 * * * *"] },
+  "observability": { "enabled": true, "traces": { "enabled": true } }
+}
