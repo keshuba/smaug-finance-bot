@@ -61,16 +61,16 @@ function fakeBudgetDb(plan, spent = 500000) {
   };
 }
 
-test('недельная часть общего плана не пополняется оставшимися деньгами периода', async () => {
+test('недельный ориентир не называется запретом при остатке общего лимита', async () => {
   const text = await weeklyBudgetReply(fakeBudgetDb({
     starts_on: '2026-04-01', ends_on: '2026-04-14',
     limit_minor: 1400000, spent_minor: 500000, remaining_minor: 900000,
-  }), { OWNER_NAME: 'Тест', BASE_CURRENCY: 'RUB' }, new Date('2026-04-02T12:00:00Z'));
+  }), { OWNER_NAME: 'Тест', BASE_CURRENCY: 'RUB' }, new Date('2026-04-02T12:00:00Z'), 'какой лимит на неделю?');
   const readable = text.replace(/\u00a0/g, ' ');
-  assert.match(readable, /до 05\.04\.2026 по плану можешь потратить 0,00/);
-  assert.match(readable, /Недельные 5 000,00.*уже потрачены/);
-  assert.match(readable, /Общий лимит — 14 000,00/);
-  assert.match(readable, /9 000,00.*06\.04\.2026–14\.04\.2026/);
+  assert.match(readable, /до конца периода в общем лимите осталось 9 000,00/);
+  assert.match(readable, /Недельный ориентир исчерпан/);
+  assert.match(readable, /не отдельный запрет/);
+  assert.doesNotMatch(readable, /можешь потратить 0,00/);
   assert.doesNotMatch(readable, /продукты|кофе|косметик/);
 });
 

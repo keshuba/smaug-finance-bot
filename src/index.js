@@ -129,25 +129,18 @@ export async function weeklyBudgetReply(db, env, now = new Date(), question = ''
   const currency = currencyOf(env);
   const b = await budgetBreakdown(db, day, currency);
   if (!b) return `${nameOf(env)}, безопасную сумму пока не назову: общий план до выплаты ещё не утверждён.`;
-  const dayLeft = Math.max(0, b.dayLimit - b.daySpent);
   const weekLeft = Math.max(0, b.weekLimit - b.weekSpent);
   const periodLeft = Math.max(0, b.budget.remaining_minor);
   const periodLabel = setting(env, 'PERIOD_LABEL', 'конца периода');
-  const next = shiftDate(b.weekEnd, 1);
-  const laterAmount = Math.max(0, periodLeft - weekLeft);
-  const later = next <= b.budget.ends_on
-    ? ` ${money(laterAmount,currency)} оставлено на ${displayDate(next)}–${displayDate(b.budget.ends_on)}.` : '';
-  const focus = /сегодня|день/i.test(question)
-    ? `сегодня по плану можешь потратить ${money(Math.min(dayLeft, weekLeft),currency)}`
-    : /период|аван|зарплат/i.test(question)
-      ? `до ${periodLabel} в общем лимите осталось ${money(periodLeft,currency)}`
-      : `до ${displayDate(b.weekEnd)} по плану можешь потратить ${money(weekLeft,currency)}`;
-  const weekly = weekLeft === 0
-    ? `Недельные ${money(b.weekLimit,currency)} уже потрачены.`
-    : `На эту неделю выделено ${money(b.weekLimit,currency)}, осталось ${money(weekLeft,currency)}.`;
-  return `${nameOf(env)}, ${focus}.\n\n` +
-    `${weekly} Общий лимит — ${money(b.budget.limit_minor,currency)}.${later}` +
-    (weekLeft === 0 ? '\n\nЕсли покупка нужна сейчас, напиши что и за сколько — пересчитаем план.' : '');
+  const main = `${nameOf(env)}, до ${periodLabel} в общем лимите осталось ${money(periodLeft,currency)}.`;
+  if (/сегодня|день/i.test(question)) {
+    const dayLeft = Math.max(0, b.dayLimit - b.daySpent);
+    const guide = dayLeft ? `Ориентир на сегодня — ${money(dayLeft,currency)}.` : 'Ориентир на сегодня исчерпан.';
+    return `${main}\n\n${guide} Это не отдельный запрет: покупку проверю по общему лимиту и обязательствам.`;
+  }
+  if (/недел/i.test(question))
+    return `${main}\n\n${weekLeft ? `Ориентир до ${displayDate(b.weekEnd)} — ${money(weekLeft,currency)}.` : 'Недельный ориентир исчерпан.'} Это часть общего лимита, а не отдельный запрет.`;
+  return main;
 }
 async function obligations(db, start, end, currency) {
   const oneOff = await rows(db, `SELECT title,due_on,amount_minor FROM scheduled_payments
@@ -354,10 +347,10 @@ async function offer(db, env, chatId, text, updateId, now) {
     amount_minor: purchase.amount_minor, available_minor: available,
     obligations_minor: due, budget_remaining_minor: budget?.budget.remaining_minor ?? null,
   });
-  if (budget && purchase.amount_minor > budget.weekLimit - budget.weekSpent)
-    assessment = { ...assessment, level: 'stop', reason: `На эту неделю выделено ${money(budget.weekLimit,baseCurrency)}, уже потрачено ${money(budget.weekSpent,baseCurrency)}. Остаток всего периода не тратим раньше времени.` };
-  else if (budget && purchase.amount_minor > budget.dayLimit - budget.daySpent && assessment.level === 'ok')
-    assessment = { ...assessment, level: 'caution', reason: 'Покупка превышает средний дневной ориентир внутри недельного лимита.' };
+  if (budget && assessment.level === 'ok' && purchase.amount_minor > budget.weekLimit - budget.weekSpent)
+    assessment = { ...assessment, level: 'caution', reason: 'Покупка превышает недельный ориентир, но помещается в общий лимит и известные обязательства.' };
+  else if (budget && assessment.level === 'ok' && purchase.amount_minor > budget.dayLimit - budget.daySpent)
+    assessment = { ...assessment, level: 'caution', reason: 'Покупка превышает средний дневной ориентир.' };
   const state = { type: 'buy_offer', id: crypto.randomUUID(), source_key: `buy:${updateId}`,
     day, item: purchase.item, amount_minor: purchase.amount_minor,
     currency: baseCurrency };
